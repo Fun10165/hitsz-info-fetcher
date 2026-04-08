@@ -1,0 +1,24 @@
+target/
+debug-artifacts/
+
+# Local secrets and auth material
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.crt
+
+# Browser/session/debug outputs
+*.log
+*.har
+*.trace
+*.jsonl
+screenshots/
+downloads/
+
+# Editor / OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
