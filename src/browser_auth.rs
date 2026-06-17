@@ -1,5 +1,5 @@
-use crate::extract::extract_page_snapshot;
-use crate::models::{AuthenticatedFetchResult, EasToken, StudentType};
+use crate::extract::{extract_notice_items, extract_page_snapshot, find_next_page_url};
+use crate::models::{AuthenticatedFetchResult, EasToken, NoticeList, StudentType};
 use anyhow::{Context, Result, anyhow, bail};
 use chromiumoxide::browser::{Browser, BrowserConfig};
 use chromiumoxide::handler::Handler;
@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -30,6 +31,8 @@ pub async fn login_and_fetch_info_via_browser(
     username: Option<&str>,
     password: Option<&str>,
     info_url: Option<&str>,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
 ) -> Result<AuthenticatedFetchResult> {
     let (mut browser, handler_task, should_close) = open_browser().await?;
 
@@ -89,17 +92,92 @@ pub async fn login_and_fetch_info_via_browser(
         .with_context(|| format!("failed to open target page {target_url} in browser"))?;
     sleep(Duration::from_secs(3)).await;
 
-    let final_url = evaluate_string_with_retry(&target_page, "() => window.location.href")
+    let first_url_str = evaluate_string_with_retry(&target_page, "() => window.location.href")
         .await
         .context("failed to read final target page URL")?;
-    let html = page_content_with_retry(&target_page)
+    let first_html = page_content_with_retry(&target_page)
         .await
         .with_context(|| format!("failed to read target page HTML from {target_url}"))?;
 
-    let final_url = Url::parse(&final_url).with_context(|| {
-        format!("browser returned invalid final target page URL: {final_url}")
+    let first_url = Url::parse(&first_url_str).with_context(|| {
+        format!("browser returned invalid final target page URL: {first_url_str}")
     })?;
-    let fetched_page = extract_page_snapshot(&final_url, &html);
+    let fetched_page = extract_page_snapshot(&first_url, &first_html);
+
+    // --- date-range notice extraction with pagination ---
+    let date_notices = if date_from.is_some() || date_to.is_some() {
+        let lower = date_from.unwrap_or("0000-01-01");
+        let upper = date_to.unwrap_or("9999-12-31");
+        let mut all_notices = extract_notice_items(&first_html, &first_url);
+        let mut pages_fetched: usize = 1;
+        let mut current_url = first_url.clone();
+
+        // Paginate while oldest notice on the current page >= lower bound.
+        // (Notices are newest-first, so .last() is the oldest on the page.)
+        loop {
+            let oldest = all_notices.last().map(|n| n.date.as_str());
+            if oldest.is_none_or(|d| d < lower) {
+                break;
+            }
+
+            let next_url = if pages_fetched == 1 {
+                find_next_page_url(&first_html, &current_url)
+            } else {
+                let cur_html = page_content_with_retry(&target_page).await?;
+                find_next_page_url(&cur_html, &current_url)
+            };
+
+            let Some(next_url) = next_url else {
+                break;
+            };
+
+            eprintln!(
+                "paginating to page {}: {}",
+                pages_fetched + 1,
+                next_url.as_str()
+            );
+
+            // Navigate via JS assignment (page context destroyed on navigation,
+            // so fire-and-forget — do not expect a return value).
+            let _ = target_page
+                .evaluate_function(&format!(
+                    "() => {{ window.location.href = {:?}; }}",
+                    next_url.as_str(),
+                ))
+                .await;
+            sleep(Duration::from_secs(3)).await;
+
+            let next_html = page_content_with_retry(&target_page)
+                .await
+                .with_context(|| {
+                    format!("failed to read page HTML from {}", next_url.as_str())
+                })?;
+
+            let page_notices = extract_notice_items(&next_html, &next_url);
+            if page_notices.is_empty() {
+                break;
+            }
+            all_notices.extend(page_notices);
+            pages_fetched += 1;
+            current_url = next_url;
+        }
+
+        // Filter to [lower, upper] inclusive
+        all_notices.retain(|n| n.date.as_str() >= lower && n.date.as_str() <= upper);
+        eprintln!(
+            "date-range [{}, {}]: {} notices from {} page(s)",
+            lower,
+            upper,
+            all_notices.len(),
+            pages_fetched
+        );
+        Some(NoticeList {
+            notices: all_notices,
+            pages_fetched,
+        })
+    } else {
+        None
+    };
 
     if should_close {
         browser.close().await.ok();
@@ -109,6 +187,7 @@ pub async fn login_and_fetch_info_via_browser(
     Ok(AuthenticatedFetchResult {
         token,
         fetched_page,
+        today_notices: date_notices,
     })
 }
 
@@ -140,6 +219,13 @@ async fn ensure_logged_in(
         return Ok(());
     }
 
+    // Browser may have cached cookies from a previous session,
+    // landing directly on the multifactor page — skip credential form.
+    if is_multifactor_page(page).await? {
+        eprintln!("existing browser session requires multifactor authentication");
+        return wait_for_login_completion(page).await;
+    }
+
     let username = username.context(
         "no authenticated Chrome session found; pass --username or set HITSZ_USERNAME to fall back to browser login",
     )?;
@@ -155,6 +241,25 @@ async fn ensure_logged_in(
     fill_credentials(page, username, password).await?;
     click_control_by_text(page, "登录").await?;
     wait_for_login_completion(page).await
+}
+
+async fn is_multifactor_page(page: &chromiumoxide::Page) -> Result<bool> {
+    let html = match page.content().await {
+        Ok(html) => html,
+        Err(_) => return Ok(false),
+    };
+    Ok(is_multifactor_html(&html))
+}
+
+fn is_multifactor_html(html: &str) -> bool {
+    html.contains("两步验证")
+        || html.contains("二次验证")
+        || html.contains("双因素")
+        || html.contains("动态码")
+        || html.contains("Multi-factor")
+        || html.contains("multifactor")
+        || html.contains("2FA")
+        || html.contains("Authentication code")
 }
 
 async fn open_browser() -> Result<(Browser, tokio::task::JoinHandle<Result<()>>, bool)> {
@@ -306,7 +411,8 @@ async fn wait_for_login_completion(page: &chromiumoxide::Page) -> Result<()> {
     let started = std::time::Instant::now();
     let mut captcha_announced = false;
     let mut two_factor_announced = false;
-    let mut two_factor_code_requested = false;
+    let mut two_factor_triggered = false;
+    let mut two_factor_submitted = false;
     loop {
         let current_url = match evaluate_string(page, "() => window.location.href").await {
             Ok(url) => url,
@@ -331,11 +437,7 @@ async fn wait_for_login_completion(page: &chromiumoxide::Page) -> Result<()> {
         if current_html.contains("用户名或密码错误") || current_html.contains("账号或密码错误") {
             bail!("browser login page reports invalid username or password");
         }
-        if current_html.contains("两步验证")
-            || current_html.contains("二次验证")
-            || current_html.contains("双因素")
-            || current_html.contains("动态码")
-        {
+        if is_multifactor_html(&current_html) {
             if !two_factor_announced {
                 let artifact_dir = persist_page_debug_artifacts(
                     page,
@@ -348,22 +450,34 @@ async fn wait_for_login_completion(page: &chromiumoxide::Page) -> Result<()> {
                     "two-factor page detected; debug artifacts saved to {}",
                     artifact_dir.display()
                 );
-                eprintln!(
-                    "waiting in visible browser window for HIT multifactor completion"
-                );
                 two_factor_announced = true;
             }
-            if !two_factor_code_requested {
-                if request_two_factor_code(page).await? {
-                    eprintln!("requested HIT app verification code from multifactor page");
+            if !two_factor_triggered {
+                if request_two_factor_code(page).await.unwrap_or(false) {
+                    eprintln!("requested verification code from multifactor page");
                 }
-                two_factor_code_requested = true;
+                two_factor_triggered = true;
+            }
+            if !two_factor_submitted {
+                match prompt_and_fill_two_factor(page).await {
+                    Ok(true) => {
+                        two_factor_submitted = true;
+                        eprintln!("verification code submitted, waiting for redirect...");
+                    }
+                    Ok(false) => {
+                        // input was empty; back off to avoid prompt spam
+                        sleep(Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("two-factor input: {e}");
+                    }
+                }
             }
         }
-        if current_html.contains("验证码") && current_html.contains("captcha") {
+        if current_html.contains("验证码") && current_html.to_lowercase().contains("captcha") {
             if !captcha_announced {
                 eprintln!(
-                    "captcha detected in browser flow; waiting for completion in visible browser window"
+                    "captcha detected; complete it in the visible browser window or retry without --accept-invalid-certs"
                 );
                 captcha_announced = true;
             }
@@ -383,6 +497,96 @@ async fn wait_for_login_completion(page: &chromiumoxide::Page) -> Result<()> {
         }
         sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Reads a verification code from terminal stdin and fills it into the 2FA page.
+/// Returns `Ok(true)` when successfully submitted, `Ok(false)` when input was empty.
+async fn prompt_and_fill_two_factor(page: &chromiumoxide::Page) -> Result<bool> {
+    print!("Enter verification code: ");
+    io::stdout().flush().context("failed to flush stdout")?;
+    let mut code = String::new();
+    io::stdin()
+        .read_line(&mut code)
+        .context("failed to read verification code from stdin")?;
+    let code = code.trim().to_owned();
+    if code.is_empty() {
+        return Ok(false);
+    }
+
+    let code_escaped = serde_json::to_string(&code)?;
+    let result = page
+        .evaluate_function(&format!(
+            r#"() => {{
+                const code = {};
+                // Try selectors for the 2FA code input
+                const inputSelectors = [
+                    '#code', '#verificationCode', '#totp', '#authcode', '#captcha',
+                    'input[name="code"]', 'input[name="verificationCode"]',
+                    'input[name="totp"]', 'input[name="authcode"]', 'input[name="captcha"]',
+                    'input[placeholder*="动态码"]', 'input[placeholder*="验证码"]',
+                ];
+                let input = null;
+                for (const sel of inputSelectors) {{
+                    try {{ input = document.querySelector(sel); }} catch(_) {{}}
+                    if (input) break;
+                }}
+                // Fallback: any visible text input not named username/password
+                if (!input) {{
+                    input = Array.from(document.querySelectorAll('input[type="text"]')).find(el => {{
+                        const name = (el.name || '').toLowerCase();
+                        const id = (el.id || '').toLowerCase();
+                        return name !== 'username' && id !== 'username'
+                            && name !== 'password' && id !== 'password';
+                    }});
+                }}
+                if (!input) return {{ ok: false, reason: 'no code input found' }};
+
+                input.focus();
+                input.value = code;
+                input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                input.dispatchEvent(new Event('change', {{ bubbles: true }}));
+
+                // Try to click submit
+                const btnSelectors = [
+                    '#submit', '#verify', '#confirm', '#login_submit',
+                    'button[type="submit"]', 'input[type="submit"]',
+                ];
+                let btn = null;
+                for (const sel of btnSelectors) {{
+                    try {{ btn = document.querySelector(sel); }} catch(_) {{}}
+                    if (btn) break;
+                }}
+                // Fallback: find button/link with submit-like text
+                if (!btn) {{
+                    const candidates = Array.from(document.querySelectorAll('a, button, input[type="submit"], input[type="button"]'));
+                    btn = candidates.find(el => {{
+                        const text = (el.innerText || el.value || '').trim();
+                        return text === '确认' || text === '提交' || text === '验证'
+                            || text === 'Verify' || text === 'Submit' || text === 'Confirm';
+                    }});
+                }}
+                if (btn) {{
+                    btn.click();
+                    return {{ ok: true, submitted: true }};
+                }}
+                return {{ ok: true, submitted: false }};
+            }}"#,
+            code_escaped,
+        ))
+        .await
+        .context("failed to fill verification code in browser")?;
+
+    let parsed: Value = result
+        .into_value()
+        .context("verification code fill result was not valid JSON")?;
+    let submitted = parsed
+        .get("submitted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !submitted {
+        eprintln!("filled verification code but could not auto-submit; click submit in browser window");
+    }
+    Ok(true)
 }
 
 async fn request_two_factor_code(page: &chromiumoxide::Page) -> Result<bool> {

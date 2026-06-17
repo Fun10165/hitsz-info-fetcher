@@ -1,4 +1,5 @@
 target/
+banks/
 debug-artifacts/
 
 # Local secrets and auth material

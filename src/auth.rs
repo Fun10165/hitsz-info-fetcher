@@ -148,6 +148,7 @@ impl AuthSession {
         Ok(AuthenticatedFetchResult {
             token,
             fetched_page,
+            today_notices: None,
         })
     }
 }

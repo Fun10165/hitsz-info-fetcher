@@ -43,6 +43,21 @@ pub struct ExtractedLink {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct NoticeItem {
+    pub title: String,
+    pub url: String,
+    pub date: String,
+    pub department: String,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NoticeList {
+    pub notices: Vec<NoticeItem>,
+    pub pages_fetched: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PageSnapshot {
     pub final_url: String,
     pub title: Option<String>,
@@ -54,4 +69,6 @@ pub struct PageSnapshot {
 pub struct AuthenticatedFetchResult {
     pub token: EasToken,
     pub fetched_page: PageSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub today_notices: Option<NoticeList>,
 }
