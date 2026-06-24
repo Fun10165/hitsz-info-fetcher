@@ -33,6 +33,7 @@ pub async fn login_and_fetch_info_via_browser(
     info_url: Option<&str>,
     date_from: Option<&str>,
     date_to: Option<&str>,
+    interactive: bool,
 ) -> Result<AuthenticatedFetchResult> {
     let (mut browser, handler_task, should_close) = open_browser().await?;
 
@@ -41,7 +42,7 @@ pub async fn login_and_fetch_info_via_browser(
         .await
         .context("failed to open JW CAS page in browser")?;
 
-    ensure_logged_in(&page, username, password).await?;
+    ensure_logged_in(&page, username, password, interactive).await?;
 
     let jw_landing_url = evaluate_string(&page, "() => window.location.href")
         .await
@@ -84,6 +85,13 @@ pub async fn login_and_fetch_info_via_browser(
         .await
         .context("failed to read browser cookies")?;
     let token = build_browser_token(username, password, &cookies, &profile_json)?;
+
+    // Save cookies for cron reuse (no browser needed next time)
+    if let Err(e) = save_cookies_to_file(&cookies, "session-cookies.json") {
+        eprintln!("warning: failed to save session cookies: {e}");
+    } else {
+        eprintln!("session cookies saved to session-cookies.json");
+    }
 
     let target_url = info_url.unwrap_or(INFO_DEFAULT_URL);
     let target_page = browser
@@ -212,6 +220,7 @@ async fn ensure_logged_in(
     page: &chromiumoxide::Page,
     username: Option<&str>,
     password: Option<&str>,
+    interactive: bool,
 ) -> Result<()> {
     if is_jw_page(page).await?
         || wait_for_existing_session(page, Duration::from_secs(EXISTING_BROWSER_WAIT_SECS)).await?
@@ -222,8 +231,7 @@ async fn ensure_logged_in(
     // Browser may have cached cookies from a previous session,
     // landing directly on the multifactor page — skip credential form.
     if is_multifactor_page(page).await? {
-        eprintln!("existing browser session requires multifactor authentication");
-        return wait_for_login_completion(page).await;
+        return wait_for_login_completion(page, interactive).await;
     }
 
     let username = username.context(
@@ -234,13 +242,17 @@ async fn ensure_logged_in(
     )?;
 
     if wait_for_selector(page, "#password", Duration::from_secs(3)).await.is_err() {
-        click_control_by_text(page, "账号登录").await?;
+        // Page may default to QR-code tab; click "账号登录" or "Account login"
+        if click_control_by_text(page, "账号登录").await.is_err() {
+            click_control_by_text(page, "Account login").await?;
+        }
         wait_for_selector(page, "#password", Duration::from_secs(20)).await?;
     }
 
     fill_credentials(page, username, password).await?;
-    click_control_by_text(page, "登录").await?;
-    wait_for_login_completion(page).await
+    // Click login button directly by ID (more reliable than text search)
+    click_login_button(page).await?;
+    wait_for_login_completion(page, interactive).await
 }
 
 async fn is_multifactor_page(page: &chromiumoxide::Page) -> Result<bool> {
@@ -252,14 +264,14 @@ async fn is_multifactor_page(page: &chromiumoxide::Page) -> Result<bool> {
 }
 
 fn is_multifactor_html(html: &str) -> bool {
-    html.contains("两步验证")
-        || html.contains("二次验证")
-        || html.contains("双因素")
-        || html.contains("动态码")
-        || html.contains("Multi-factor")
-        || html.contains("multifactor")
-        || html.contains("2FA")
-        || html.contains("Authentication code")
+    // The IDS login page itself contains "动态码" as a tab label,
+    // so we require the reAuthCheck marker to avoid false positives.
+    html.contains("reAuthCheck")
+        || html.contains("reAuthLoginView")
+        || (html.contains("两步验证") && !html.contains("请输入学号"))
+        || (html.contains("二次验证") && !html.contains("请输入学号"))
+        || (html.contains("双因素") && !html.contains("请输入学号"))
+        || (html.contains("multifactor") && !html.contains("passwordText"))
 }
 
 async fn open_browser() -> Result<(Browser, tokio::task::JoinHandle<Result<()>>, bool)> {
@@ -407,7 +419,7 @@ async fn wait_for_existing_session(page: &chromiumoxide::Page, timeout: Duration
     }
 }
 
-async fn wait_for_login_completion(page: &chromiumoxide::Page) -> Result<()> {
+async fn wait_for_login_completion(page: &chromiumoxide::Page, interactive: bool) -> Result<()> {
     let started = std::time::Instant::now();
     let mut captcha_announced = false;
     let mut two_factor_announced = false;
@@ -459,18 +471,22 @@ async fn wait_for_login_completion(page: &chromiumoxide::Page) -> Result<()> {
                 two_factor_triggered = true;
             }
             if !two_factor_submitted {
-                match prompt_and_fill_two_factor(page).await {
-                    Ok(true) => {
-                        two_factor_submitted = true;
-                        eprintln!("verification code submitted, waiting for redirect...");
+                if interactive {
+                    match prompt_and_fill_two_factor(page).await {
+                        Ok(true) => {
+                            two_factor_submitted = true;
+                            eprintln!("verification code submitted, waiting for redirect...");
+                        }
+                        Ok(false) => {
+                            sleep(Duration::from_secs(2)).await;
+                        }
+                        Err(e) => {
+                            eprintln!("two-factor input: {e}");
+                        }
                     }
-                    Ok(false) => {
-                        // input was empty; back off to avoid prompt spam
-                        sleep(Duration::from_secs(2)).await;
-                    }
-                    Err(e) => {
-                        eprintln!("two-factor input: {e}");
-                    }
+                } else {
+                    eprintln!("multifactor detected; waiting (non-interactive mode)");
+                    two_factor_submitted = true;
                 }
             }
         }
@@ -682,6 +698,33 @@ async fn click_control_by_text(page: &chromiumoxide::Page, label: &str) -> Resul
     Ok(())
 }
 
+async fn click_login_button(page: &chromiumoxide::Page) -> Result<()> {
+    // The IDS login button is <a id="login_submit" class="login-btn">Login</a>
+    page
+        .evaluate_function(
+            r#"() => {
+                const btn = document.getElementById('login_submit')
+                    || document.querySelector('a.login-btn')
+                    || document.querySelector('button[type="submit"]');
+                if (!btn) {
+                    // Fallback: find by text
+                    const candidates = Array.from(document.querySelectorAll('a,button'));
+                    const textBtn = candidates.find(el =>
+                        ['登录','Login','login'].includes((el.innerText || '').trim())
+                    );
+                    if (textBtn) { textBtn.click(); return 'text'; }
+                    throw new Error('Could not find login button');
+                }
+                btn.click();
+                return 'id';
+            }"#,
+        )
+        .await
+        .context("failed to click login button")?;
+    sleep(Duration::from_secs(1)).await;
+    Ok(())
+}
+
 async fn fill_credentials(
     page: &chromiumoxide::Page,
     username: &str,
@@ -690,17 +733,26 @@ async fn fill_credentials(
     let fill_result = page
         .evaluate_function(&format!(
         r#"() => {{
-            const visible = (node) => !!(node && (node.offsetParent !== null || window.getComputedStyle(node).position === 'fixed'));
-            const usernameInput = Array.from(document.querySelectorAll('input')).find((node) => node.id === 'username' && visible(node));
-            const passwordInput = Array.from(document.querySelectorAll('input')).find((node) => node.id === 'password' && visible(node));
+            // The IDS page has id="username" (text) and id="password" (name="passwordText", visible).
+            // A hidden id="saltPassword" (name="password") gets populated by page JS on submit.
+            // We fill the visible inputs and dispatch proper events so the page's
+            // encryption listener picks up the password.
+            const usernameInput = document.getElementById('username');
+            const passwordInput = document.getElementById('password');
             if (!usernameInput || !passwordInput) {{
-                throw new Error('Could not find visible username/password inputs');
+                throw new Error('Could not find #username or #password inputs');
             }}
             const applyValue = (node, value) => {{
                 node.focus();
                 node.value = value;
+                // Use native setter to bypass React/framework overrides
+                const nativeSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                nativeSetter.call(node, value);
                 node.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 node.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                node.dispatchEvent(new Event('blur', {{ bubbles: true }}));
             }};
             applyValue(usernameInput, {:?});
             applyValue(passwordInput, {:?});
@@ -712,7 +764,7 @@ async fn fill_credentials(
         username, password
     ))
         .await
-        .context("failed to fill username/password in visible browser form")?;
+        .context("failed to fill username/password in browser form")?;
     let fill_result = fill_result
         .into_value::<Value>()
         .context("browser form fill result was not valid JSON")?;
@@ -725,7 +777,7 @@ async fn fill_credentials(
         .and_then(Value::as_u64)
         .unwrap_or_default();
     eprintln!(
-        "filled login form in browser: username_len={}, password_len={}, username_matches={}",
+        "filled login form: username_len={}, password_len={}, username_matches={}",
         filled_username.len(),
         password_length,
         filled_username == username
@@ -823,4 +875,171 @@ fn get_string(value: &Value, key: &str) -> Option<String> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(ToOwned::to_owned)
+}
+
+// ── cookie persistence for cron reuse ───────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedCookie {
+    name: String,
+    value: String,
+    domain: String,
+    path: String,
+}
+
+fn save_cookies_to_file(cookies: &[Cookie], path: &str) -> Result<()> {
+    let saved: Vec<SavedCookie> = cookies
+        .iter()
+        .map(|c| SavedCookie {
+            name: c.name.clone(),
+            value: c.value.clone(),
+            domain: c.domain.clone(),
+            path: c.path.clone(),
+        })
+        .collect();
+    let json = serde_json::to_string_pretty(&saved)?;
+    std::fs::write(path, json)
+        .with_context(|| format!("failed to write cookie file {path}"))?;
+    Ok(())
+}
+
+
+fn extract_js_redirect(html: &str) -> Option<String> {
+    // Parse window.location.href='...' or window.location.href="..."
+    let marker = "window.location.href=";
+    let pos = html.find(marker)?;
+    let rest = &html[pos + marker.len()..];
+    let quote = rest.chars().next()?;
+    if quote != '\'' && quote != '"' { return None; }
+    let end = rest[1..].find(quote)?;
+    Some(rest[1..1 + end].to_string())
+}
+pub async fn fetch_info_with_saved_cookies(
+    cookie_file: &str,
+    info_url: &str,
+    date_from: Option<&str>,
+    date_to: Option<&str>,
+) -> Result<Option<AuthenticatedFetchResult>> {
+    use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
+    use std::sync::Arc;
+
+    let raw = std::fs::read_to_string(cookie_file)
+        .with_context(|| format!("failed to read cookie file {cookie_file}"))?;
+    let saved: Vec<SavedCookie> = serde_json::from_str(&raw)
+        .context("failed to parse cookie file")?;
+
+    // Build a proper cookie store so domain-scoped cookies (CASTGC on
+    // ids.hit.edu.cn, JSESSIONID on jw.hitsz.edu.cn) are sent correctly
+    // when reqwest follows the CAS redirect chain.
+    let mut store = CookieStore::default();
+    for c in &saved {
+        let domain = if c.domain.starts_with('.') {
+            c.domain.clone()
+        } else {
+            c.domain.clone()
+        };
+        let url = format!("https://{domain}/");
+        if let Ok(url) = Url::parse(&url) {
+            let cookie_str = format!("{}={}; Path={}", c.name, c.value, c.path);
+            let _ = store.parse(&cookie_str, &url);
+        }
+    }
+    let store_arc = Arc::new(CookieStoreMutex::new(store));
+
+    let client = reqwest::Client::builder()
+        .cookie_provider(store_arc.clone())
+        .danger_accept_invalid_certs(true)
+        .build()
+        .context("failed to build HTTP client")?;
+
+    let resp = client
+        .get(info_url)
+        .send()
+        .await
+        .context("failed to fetch info page with saved cookies")?;
+
+    let mut final_url = resp.url().clone();
+    let mut html = resp.text().await?;
+
+    // The info portal uses JS redirects (window.location.href=...) for CAS,
+    // which reqwest can't follow. Parse and follow manually.
+    if html.contains("window.location.href") && !html.contains("Newslist") {
+        if let Some(js_url) = extract_js_redirect(&html) {
+            eprintln!("following JS redirect to {}", js_url);
+            let resp2 = client.get(&js_url).send().await
+                .context("failed to follow JS redirect")?;
+            final_url = resp2.url().clone();
+            html = resp2.text().await?;
+        }
+    }
+
+    // May need one more hop through CAS
+    if html.contains("window.location.href") && !html.contains("Newslist") {
+        if let Some(js_url) = extract_js_redirect(&html) {
+            eprintln!("following JS redirect to {}", js_url);
+            let resp3 = client.get(&js_url).send().await?;
+            final_url = resp3.url().clone();
+            html = resp3.text().await?;
+        }
+    }
+
+    // Check if we got redirected to CAS login (cookies expired)
+    if final_url.host_str() != Some("info.hitsz.edu.cn")
+        || html.contains("authserver/login")
+        || (html.contains("caslogin") && !html.contains("Newslist"))
+    {
+        eprintln!("saved cookies expired (redirected to CAS login)");
+        return Ok(None);
+    }
+
+    let final_url = Url::parse(&final_url.to_string())?;
+    let fetched_page = extract_page_snapshot(&final_url, &html);
+
+    // Date-range notice extraction with pagination
+    let date_notices = if date_from.is_some() || date_to.is_some() {
+        let lower = date_from.unwrap_or("0000-01-01");
+        let upper = date_to.unwrap_or("9999-12-31");
+        let mut all_notices = extract_notice_items(&html, &final_url);
+        let mut pages_fetched: usize = 1;
+        let mut current_url = final_url.clone();
+
+        loop {
+            let oldest = all_notices.last().map(|n| n.date.as_str());
+            if oldest.is_none_or(|d| d < lower) {
+                break;
+            }
+            let next_url = find_next_page_url(&html, &current_url);
+            let Some(next_url) = next_url else { break };
+
+            eprintln!("paginating to page {}: {}", pages_fetched + 1, next_url.as_str());
+
+            let next_resp = client.get(next_url.as_str()).send().await?;
+            let next_html = next_resp.text().await?;
+
+            let page_notices = extract_notice_items(&next_html, &next_url);
+            if page_notices.is_empty() { break }
+            all_notices.extend(page_notices);
+            pages_fetched += 1;
+            current_url = next_url;
+        }
+
+        all_notices.retain(|n| n.date.as_str() >= lower && n.date.as_str() <= upper);
+        eprintln!("date-range [{}, {}]: {} notices from {} page(s)", lower, upper, all_notices.len(), pages_fetched);
+        Some(NoticeList { notices: all_notices, pages_fetched })
+    } else {
+        None
+    };
+
+    let token = EasToken {
+        cookies: saved.iter().map(|c| (c.name.clone(), c.value.clone())).collect(),
+        username: String::new(), password: String::new(),
+        name: None, stutype: StudentType::Undergrad,
+        picture: None, id: None, stu_id: None,
+        school: None, major: None, grade: None,
+        sfxsx: None, email: None, phone: None,
+    };
+
+    Ok(Some(AuthenticatedFetchResult {
+        token, fetched_page, today_notices: date_notices,
+    }))
 }

@@ -17,3 +17,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 url = "2.5"
 rpassword = "7.5.4"
 chrono = "0.4.45"
+aes = "0.9.1"
+cbc = "0.2.1"
+rand = "0.10.1"
+base64 = "0.22.1"
+generic-array = "1.4.3"
