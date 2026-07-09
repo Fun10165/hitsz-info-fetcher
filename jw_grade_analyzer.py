@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """HITSZ JW 成绩分布分析工具
 
-通过 JW 教务系统 seeFx 接口漏洞获取全班成绩明细，
+通过 JW 教务系统 seeFx 接口获取全班成绩明细，
 计算你在班级中的百分位排名和挂科率。
 
 用法:
@@ -151,7 +151,7 @@ def query_yxkc(opener, pylx="1"):
 
 
 def query_seefx(opener, rwid):
-    """seeFx 不带 cjid → 返回全班所有人的成绩明细（漏洞）"""
+    """seeFx 不带 cjid → 返回全班所有人的成绩明细"""
     body = http_post(opener, "/cjgl/grcjcx/seeFx", f"rwid={rwid}")
     try:
         return json.loads(body)
