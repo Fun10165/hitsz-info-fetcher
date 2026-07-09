@@ -278,7 +278,12 @@ def print_ranking_table(results):
         my_r = f'{r["my_rank"]}/{n}' if r["my_rank"] else "?"
         pct = f'{r["my_pct"]:.1f}%' if r["my_pct"] is not None else "?"
         sem = SEM_NAMES.get(r["xnxq"], r["xnxq"])
-        print(f'| {i} | {r["name"]} | {sem} | {n} | {my_t} | {my_r} | {pct} | {r["mean"]:.1f} | {r["median"]:.1f} | {r["stdev"]:.1f} | {r["max"]:.1f} | {r["min"]:.1f} |')
+        mean = f'{r["mean"]:.1f}' if r["mean"] is not None else "--"
+        median = f'{r["median"]:.1f}' if r["median"] is not None else "--"
+        stdev = f'{r["stdev"]:.1f}' if r["stdev"] is not None else "--"
+        mx = f'{r["max"]:.1f}' if r["max"] is not None else "--"
+        mn = f'{r["min"]:.1f}' if r["min"] is not None else "--"
+        print(f'| {i} | {r["name"]} | {sem} | {n} | {my_t} | {my_r} | {pct} | {mean} | {median} | {stdev} | {mx} | {mn} |')
 
     pcts = [r["my_pct"] for r in ranked if r["my_pct"] is not None]
     if pcts:
@@ -312,7 +317,12 @@ def print_details(results):
                     print(f'    {fxmc}: {df}/{mf} (占比{ljfxbz}%)')
             else:
                 print(f'    (无法定位自己的成绩 — 该课不在 grcjcx 中且无 cjid)')
-            print(f'    班级: 平均{r["mean"]} 中位{r["median"]} 标准差{r["stdev"]} 最高{r["max"]} 最低{r["min"]}')
+            mean = r["mean"] if r["mean"] is not None else "--"
+            median = r["median"] if r["median"] is not None else "--"
+            stdev = r["stdev"] if r["stdev"] is not None else "--"
+            mx = r["max"] if r["max"] is not None else "--"
+            mn = r["min"] if r["min"] is not None else "--"
+            print(f'    班级: 平均{mean} 中位{median} 标准差{stdev} 最高{mx} 最低{mn}')
 
 
 # ── 输出: 挂科率统计 ──────────────────────────────────────────────────
