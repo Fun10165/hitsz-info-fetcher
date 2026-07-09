@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hitsz.info-fetcher.cookie-refresh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/fun10165/hitsz-info-fetcher/auto_refresh.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/fun10165/hitsz-info-fetcher</string>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/Users/fun10165/hitsz-info-fetcher/auto_refresh.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/fun10165/hitsz-info-fetcher/auto_refresh.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Users/fun10165/.cargo/bin</string>
+        <key>HOME</key>
+        <string>/Users/fun10165</string>
+    </dict>
+</dict>
+</plist>

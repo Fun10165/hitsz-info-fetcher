@@ -17,9 +17,15 @@ debug-artifacts/
 *.jsonl
 screenshots/
 downloads/
+session-cookies.json
+
+# Python cache
+__pycache__/
+*.pyc
 
 # Editor / OS files
 .DS_Store
+notices.json
 .idea/
 .vscode/
 *.swp

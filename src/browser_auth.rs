@@ -27,6 +27,93 @@ const REMOTE_DEBUG_CANDIDATES: [&str; 3] = [
     "http://localhost:9222",
 ];
 
+/// Browser-only login — returns HitToken without fetching info pages.
+/// Used by hit_auth module as the browser auth path.
+pub async fn browser_login(
+    username: &str,
+    password: &str,
+) -> Result<crate::hit_auth::HitToken> {
+    let (mut browser, handler_task, should_close) = open_browser().await?;
+
+    let page = browser
+        .new_page(JW_CAS_URL)
+        .await
+        .context("failed to open JW CAS page in browser")?;
+
+    ensure_logged_in(&page, Some(username), Some(password), true).await?;
+
+    let jw_landing_url = evaluate_string(&page, "() => window.location.href")
+        .await
+        .unwrap_or_else(|_| "<unavailable>".to_owned());
+    eprintln!("browser login completed; current page is {jw_landing_url}");
+
+    let profile_page = browser
+        .new_page("http://jw.hitsz.edu.cn/")
+        .await
+        .context("failed to open authenticated JW page for profile fetch")?;
+    sleep(Duration::from_secs(2)).await;
+
+    let profile_json = evaluate_string_with_retry(
+        &profile_page,
+        &format!(
+            r#"async () => {{
+                const profileUrl = new URL({:?}, window.location.origin).toString();
+                const resp = await fetch(profileUrl, {{
+                    method: 'POST',
+                    headers: {{ 'X-Requested-With': 'XMLHttpRequest' }},
+                    credentials: 'include'
+                }});
+                return await resp.text();
+            }}"#,
+            JW_PROFILE_PATH
+        ),
+    )
+    .await
+    .context("failed to fetch authenticated profile JSON through browser session")?;
+
+    if profile_json.contains("session已失效") {
+        bail!("browser-authenticated profile request reported expired session");
+    }
+    if profile_json.trim_start().starts_with('<') {
+        bail!("browser-authenticated profile request returned HTML instead of JSON");
+    }
+
+    let cookies = browser
+        .get_cookies()
+        .await
+        .context("failed to read browser cookies")?;
+
+    // Save cookies for cron reuse
+    if let Err(e) = save_cookies_to_file(&cookies, "session-cookies.json") {
+        eprintln!("warning: failed to save session cookies: {e}");
+    } else {
+        eprintln!("session cookies saved to session-cookies.json");
+    }
+
+    if should_close {
+        browser.close().await.ok();
+    }
+    handler_task.abort();
+
+    // Build HitToken from profile JSON + cookies
+    let token = build_browser_token(Some(username), Some(password), &cookies, &profile_json)?;
+    use crate::hit_auth::HitToken;
+    Ok(HitToken {
+        username: token.username,
+        name: token.name,
+        student_id: token.stu_id,
+        school: token.school,
+        stutype: Some(match token.stutype {
+            crate::models::StudentType::Undergrad => "undergrad".into(),
+            crate::models::StudentType::Grad => "grad".into(),
+        }),
+        phone: token.phone,
+        access_token: None,
+        refresh_token: None,
+        cookies: cookies.iter().map(|c| (c.name.clone(), c.value.clone())).collect(),
+    })
+}
+
 pub async fn login_and_fetch_info_via_browser(
     username: Option<&str>,
     password: Option<&str>,
