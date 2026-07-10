@@ -3,6 +3,7 @@
 
 通过 JW 教务系统 seeFx 接口获取全班成绩明细，
 计算你在班级中的百分位排名和挂科率。
+通过 queryZxcjPage 接口获取刚录入但未公布的成绩。
 
 用法:
   1. 浏览器登录 jw.hitsz.edu.cn
@@ -159,6 +160,34 @@ def query_seefx(opener, rwid):
         return []
 
 
+def get_xjid(opener, xh):
+    """通过学号获取学籍ID (xjid)"""
+    body = http_post_json(opener, "/cjgl/cjzhtjcx/cjcx/getXs", {"xjidorxh": xh})
+    try:
+        d = json.loads(body)
+        items = d.get("content", [])
+        if items and items[0].get("xjid"):
+            return items[0]["xjid"]
+    except:
+        pass
+    return None
+
+
+def query_zxcjPage(opener, xh, xjid, pylx="1"):
+    """综合成绩查询 — 包含刚录入但未公布的成绩。
+    返回列表，每项包含 kcmc, zzzscj (最终折算成绩), rwh 等字段。"""
+    payload = {
+        "current": 1, "pageSize": 200,
+        "xh": xh, "xjid": xjid, "pylx": pylx,
+    }
+    body = http_post_json(opener, "/cjgl/cjzhtjcx/cjcx/queryZxcjPage", payload)
+    try:
+        d = json.loads(body)
+        return d.get("pageInfo", {}).get("list", [])
+    except:
+        return []
+
+
 # ── 加权计算 ──────────────────────────────────────────────────────────
 
 def compute_weighted_scores(seeFx_data):
@@ -168,7 +197,6 @@ def compute_weighted_scores(seeFx_data):
     总分: Σ(normalized * LJFXBZ / 100)
     如果 ΣLJFXBZ ≠ 100，按总权重归一化。
     """
-    # 提取分项的 MF 和 LJFXBZ（同一分项对所有学生相同）
     component_info = {}
     for item in seeFx_data:
         fxmc = item.get("FXMC", "")
@@ -185,7 +213,6 @@ def compute_weighted_scores(seeFx_data):
 
     total_weight = sum(info["ljfxbz"] for info in component_info.values())
 
-    # 按学生聚合
     by_student = defaultdict(dict)
     for item in seeFx_data:
         xid = item.get("XSCJB_ID", "")
@@ -216,9 +243,20 @@ def compute_weighted_scores(seeFx_data):
     return student_scores, component_info
 
 
+def find_my_xscjb_ids(seeFx_data, zzzscj, tolerance=0.05):
+    """在 seeFx 全班数据中用加权总分定位自己。
+    返回匹配的 XSCJB_ID 集合。多匹配时取第一个。"""
+    student_scores, _ = compute_weighted_scores(seeFx_data)
+    matches = set()
+    for xid, total in student_scores.items():
+        if abs(total - zzzscj) <= tolerance:
+            matches.add(xid)
+    return matches
+
+
 # ── 分析逻辑 ──────────────────────────────────────────────────────────
 
-def analyze_course(name, rwid, cjid, xnxq, seeFx_data):
+def analyze_course(name, rwid, cjid, xnxq, seeFx_data, zxcj_score=None):
     student_scores, component_info = compute_weighted_scores(seeFx_data)
     n = len(student_scores)
     if n == 0:
@@ -226,6 +264,15 @@ def analyze_course(name, rwid, cjid, xnxq, seeFx_data):
 
     totals_list = list(student_scores.values())
     my_total = student_scores.get(cjid) if cjid else None
+
+    # 如果没有 cjid 但有 queryZxcjPage 的分数，用分数匹配定位
+    my_components = {}
+    if not my_total and zxcj_score is not None:
+        matches = find_my_xscjb_ids(seeFx_data, zxcj_score)
+        if matches:
+            matched_cjid = list(matches)[0]  # 取第一个匹配
+            my_total = student_scores.get(matched_cjid)
+            cjid = matched_cjid
 
     sorted_totals = sorted(totals_list, reverse=True)
     my_rank = None
@@ -235,7 +282,6 @@ def analyze_course(name, rwid, cjid, xnxq, seeFx_data):
         my_pct = round((1 - (my_rank - 1) / n) * 100, 1)
 
     # 我的分项明细
-    my_components = {}
     if cjid:
         for item in seeFx_data:
             if item.get("XSCJB_ID") == cjid:
@@ -316,7 +362,7 @@ def print_details(results):
                     ljfxbz = info["ljfxbz"]
                     print(f'    {fxmc}: {df}/{mf} (占比{ljfxbz}%)')
             else:
-                print(f'    (无法定位自己的成绩 — 该课不在 grcjcx 中且无 cjid)')
+                print(f'    (无法定位自己的成绩)')
             mean = r["mean"] if r["mean"] is not None else "--"
             median = r["median"] if r["median"] is not None else "--"
             stdev = r["stdev"] if r["stdev"] is not None else "--"
@@ -341,7 +387,11 @@ def print_fail_rate_table(results):
         fail = r["fail_count"]
         rate = fail / n * 100
         sem = SEM_NAMES.get(r["xnxq"], r["xnxq"])
-        print(f'| {i} | {r["name"]} | {sem} | {n} | {fail} | {rate:.1f}% | {r["mean"]:.1f} | {r["median"]:.1f} | {r["max"]:.1f} | {r["min"]:.1f} |')
+        mean = f'{r["mean"]:.1f}' if r["mean"] is not None else "--"
+        median = f'{r["median"]:.1f}' if r["median"] is not None else "--"
+        mx = f'{r["max"]:.1f}' if r["max"] is not None else "--"
+        mn = f'{r["min"]:.1f}' if r["min"] is not None else "--"
+        print(f'| {i} | {r["name"]} | {sem} | {n} | {fail} | {rate:.1f}% | {mean} | {median} | {mx} | {mn} |')
 
     total_students = sum(r["n_students"] for r in has_data)
     total_fails = sum(r["fail_count"] for r in has_data)
@@ -349,15 +399,15 @@ def print_fail_rate_table(results):
     print(f"总课程数: {len(has_data)}")
     print(f"总成绩记录: {total_students}")
     print(f"总挂科人数: {total_fails}")
-    print(f"总体挂科率: {total_fails/total_students*100:.1f}%")
+    print(f"总体挂科率: {total_fails/total_students*100:.1f}%" if total_students > 0 else "")
 
-    # 挂科率最高的课
-    print()
-    print("挂科率 Top 5:")
     top_fails = sorted(has_data, key=lambda r: r["fail_count"] / r["n_students"], reverse=True)
-    for r in top_fails[:5]:
-        rate = r["fail_count"] / r["n_students"] * 100
-        print(f'  {r["name"]} ({SEM_NAMES.get(r["xnxq"], r["xnxq"])})  {r["fail_count"]}/{r["n_students"]} = {rate:.1f}%')
+    if top_fails:
+        print()
+        print("挂科率 Top 5:")
+        for r in top_fails[:5]:
+            rate = r["fail_count"] / r["n_students"] * 100
+            print(f'  {r["name"]} ({SEM_NAMES.get(r["xnxq"], r["xnxq"])})  {r["fail_count"]}/{r["n_students"]} = {rate:.1f}%')
 
 
 # ── 主流程 ────────────────────────────────────────────────────────────
@@ -375,7 +425,6 @@ def main():
     parser.add_argument("--details", action="store_true", help="打印分项明细")
     args = parser.parse_args()
 
-    # 构建 opener
     if args.jsessionid and args.route:
         cookies = f"JSESSIONID={args.jsessionid}; route={args.route}"
         opener = make_opener(cookies_str=cookies)
@@ -392,15 +441,39 @@ def main():
         print("  3. 复制 JSESSIONID 和 route 的值")
         sys.exit(1)
 
-    # 验证 session
     profile = verify_session(opener)
     pylx = args.pylx
+    xh = profile.get("XH", "")
 
-    # Step 1: 查询成绩列表
-    print("\n📋 查询成绩列表...")
+    # 获取 xjid (优先用 profile ID, 否则调 getXs)
+    xjid = profile.get("ID", "")
+    if not xjid:
+        xjid = get_xjid(opener, xh)
+
+    # Step 1: grcjcx
+    print("\n📋 查询成绩列表 (grcjcx)...")
     grades = query_grcjcx(opener, pylx)
     print(f"  grcjcx 返回 {len(grades)} 门课")
 
+    # Step 2: queryZxcjPage (含未公布成绩)
+    print("\n📋 查询综合成绩 (queryZxcjPage)...")
+    zxcj_list = []
+    zxcj_score = {}
+    if xjid:
+        zxcj_list = query_zxcjPage(opener, xh, xjid, pylx)
+        print(f"  queryZxcjPage 返回 {len(zxcj_list)} 门课")
+        for item in zxcj_list:
+            rwh = item.get("rwh", "")
+            score_str = item.get("zzzscj", "")
+            if rwh and score_str:
+                try:
+                    zxcj_score[rwh] = float(score_str)
+                except:
+                    pass
+    else:
+        print(f"  ⚠️ 无 xjid，跳过综合成绩查询")
+
+    # cjid 映射
     cjid_map = {}
     for item in grades:
         rwid = item.get("rwid", "")
@@ -408,13 +481,13 @@ def main():
         if rwid and cjid:
             cjid_map[rwid] = cjid
 
-    # Step 2: 查询已选课程
+    # Step 3: queryYxkc
     print("\n📋 查询本学期选课...")
     yxkc = query_yxkc(opener, pylx)
     if yxkc:
         print(f"  queryYxkc 返回 {len(yxkc)} 门课")
 
-    # Step 3: 合并课程
+    # Step 4: 合并课程
     all_courses = {}
     for item in grades:
         rwid = item.get("rwid", "")
@@ -424,6 +497,7 @@ def main():
                 "rwid": rwid,
                 "cjid": item.get("id", ""),
                 "xnxq": item.get("xnxq", ""),
+                "rwh": item.get("rwh", ""),
             }
     for item in yxkc:
         rwid = item.get("rwid", "")
@@ -433,16 +507,24 @@ def main():
                 "rwid": rwid,
                 "cjid": "",
                 "xnxq": "2025-20262",
+                "rwh": item.get("rwh", ""),
             }
 
     print(f"\n📊 共 {len(all_courses)} 门课，开始拉取全班成绩明细...")
 
-    # Step 4: 逐课调用 seeFx
+    # Step 5: 逐课调用 seeFx
     results = []
     for i, (rwid, course) in enumerate(all_courses.items()):
         seeFx_data = query_seefx(opener, rwid)
         cjid = course["cjid"] or cjid_map.get(rwid, "")
-        r = analyze_course(course["name"], rwid, cjid, course["xnxq"], seeFx_data)
+        
+        # 无 cjid 时尝试用 queryZxcjPage 的分数定位
+        my_zxcj = None
+        if not cjid:
+            rwh = course.get("rwh", "")
+            my_zxcj = zxcj_score.get(rwh)
+
+        r = analyze_course(course["name"], rwid, cjid, course["xnxq"], seeFx_data, zxcj_score=my_zxcj)
         if r:
             results.append(r)
         else:
@@ -459,7 +541,7 @@ def main():
 
     print(f"  完成: {len(results)} 门课")
 
-    # Step 5: 输出
+    # Step 6: 输出
     if args.fail_rate:
         print("\n" + "=" * 80)
         print("  挂科率统计")
@@ -477,23 +559,17 @@ def main():
             print("=" * 80)
             print_details(results)
 
-    # 保存
     if args.output:
         save_data = []
         for r in results:
             save_data.append({
-                "name": r["name"],
-                "xnxq": r["xnxq"],
+                "name": r["name"], "xnxq": r["xnxq"],
                 "n_students": r["n_students"],
-                "my_total": r["my_total"],
-                "my_rank": r["my_rank"],
+                "my_total": r["my_total"], "my_rank": r["my_rank"],
                 "my_pct": r["my_pct"],
                 "my_components": r.get("my_components", {}),
-                "mean": r["mean"],
-                "median": r["median"],
-                "stdev": r["stdev"],
-                "max": r["max"],
-                "min": r["min"],
+                "mean": r["mean"], "median": r["median"],
+                "stdev": r["stdev"], "max": r["max"], "min": r["min"],
                 "fail_count": r.get("fail_count", 0),
             })
         with open(args.output, "w", encoding="utf-8") as f:
