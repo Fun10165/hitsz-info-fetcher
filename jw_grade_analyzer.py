@@ -459,17 +459,24 @@ def main():
     print("\n📋 查询综合成绩 (queryZxcjPage)...")
     zxcj_list = []
     zxcj_score = {}
+    zxcj_score_by_name = {}
     if xjid:
         zxcj_list = query_zxcjPage(opener, xh, xjid, pylx)
         print(f"  queryZxcjPage 返回 {len(zxcj_list)} 门课")
         for item in zxcj_list:
             rwh = item.get("rwh", "")
+            kcmc = item.get("kcmc", "")
             score_str = item.get("zzzscj", "")
-            if rwh and score_str:
-                try:
-                    zxcj_score[rwh] = float(score_str)
-                except:
-                    pass
+            if not score_str:
+                continue
+            try:
+                score_val = float(score_str)
+            except:
+                continue
+            if rwh:
+                zxcj_score[rwh] = score_val
+            if kcmc:
+                zxcj_score_by_name[kcmc] = score_val
     else:
         print(f"  ⚠️ 无 xjid，跳过综合成绩查询")
 
@@ -521,8 +528,9 @@ def main():
         # 无 cjid 时尝试用 queryZxcjPage 的分数定位
         my_zxcj = None
         if not cjid:
-            rwh = course.get("rwh", "")
-            my_zxcj = zxcj_score.get(rwh)
+            my_zxcj = zxcj_score.get(course.get("rwh", ""))
+            if my_zxcj is None:
+                my_zxcj = zxcj_score_by_name.get(course.get("name", ""))
 
         r = analyze_course(course["name"], rwid, cjid, course["xnxq"], seeFx_data, zxcj_score=my_zxcj)
         if r:
