@@ -226,7 +226,7 @@ mod tests {
         let json = r#"{
             "access_token": "abc123def456", "refresh_token": "ref789",
             "data": { "pylx": "1", "yhxm": "王五", "bmmc": "信息学部" },
-            "info": { "yhdm": "2024311009", "xm": "王五", "roles": ["01"] }
+            "info": { "yhdm": "2023311001", "xm": "王五", "roles": ["01"] }
         }"#;
         let resp: MjwLdapResponse = serde_json::from_str(json).expect("parse");
         assert_eq!(resp.access_token.as_deref(), Some("abc123def456"));

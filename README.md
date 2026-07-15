@@ -11,7 +11,7 @@ cargo run
 If no credentials are provided, the CLI prompts interactively (password input is hidden):
 
 ```
-Username: 2024311009
+Username: 2023311001
 Password: 
 ```
 
@@ -87,13 +87,13 @@ Standard output is pretty-printed JSON:
 ```json
 {
   "token": {
-    "username": "2024311009",
-    "name": "孙昊",
+    "username": "2023311001",
+    "name": "王五",
     "stutype": "undergrad",
-    "stu_id": "2024311009",
+    "stu_id": "2023311001",
     "school": "信息学部",
     "major": "工科试验班（计算机与电子通信）",
-    "grade": "2024",
+    "grade": "2023",
     "email": "ENC:...",
     "phone": "ENC:..."
   },
